@@ -1570,6 +1570,1607 @@ describe("tool()", () => {
       ),
     ).rejects.toThrow(/Tool nonexistent-tool not found/);
   });
+
+  /***
+   * Test: Remote Tool Functionality (bypasses Zod validation)
+   */
+  test("should register and call remote tools without Zod validation", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    // Register a remote tool that bypasses Zod validation
+    mcpServer.registerTool(
+      "remote-tool",
+      {
+        title: "Remote Tool",
+        description: "A tool that passes through arguments without validation",
+        remote: true,
+        remoteInputSchema: {
+          type: "object",
+          properties: {
+            input: { type: "string" },
+            value: { type: "number" }
+          }
+        },
+        remoteOutputSchema: {
+          type: "object", 
+          properties: {
+            result: { type: "string" }
+          }
+        }
+      },
+      async (args) => {
+        // The arguments should be passed through without Zod parsing
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Remote tool called with: ${JSON.stringify(args)}`,
+            },
+          ],
+        };
+      }
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    // Test that the tool is listed correctly with remote schema
+    const listResult = await client.request(
+      {
+        method: "tools/list",
+      },
+      ListToolsResultSchema
+    );
+
+    const remoteTool = listResult.tools.find(t => t.name === "remote-tool");
+    expect(remoteTool).toBeDefined();
+    expect(remoteTool?.title).toBe("Remote Tool");
+    expect(remoteTool?.inputSchema).toEqual({
+      type: "object",
+      properties: {
+        input: { type: "string" },
+        value: { type: "number" }
+      }
+    });
+
+    // Test calling the remote tool with arguments that would fail Zod validation
+    // if it were using normal validation (e.g., extra fields)
+    const callResult = await client.request(
+      {
+        method: "tools/call", 
+        params: {
+          name: "remote-tool",
+          arguments: {
+            input: "test input",
+            value: 42,
+            extraField: "this would normally fail Zod validation"
+          }
+        }
+      },
+      CallToolResultSchema
+    );
+
+    expect(callResult.content).toHaveLength(1);
+    expect(callResult.content[0]).toEqual({
+      type: "text",
+      text: `Remote tool called with: {"input":"test input","value":42,"extraField":"this would normally fail Zod validation"}`,
+    });
+
+    await client.close();
+    await mcpServer.server.close();
+  });
+});
+
+describe("ResourceTemplate", () => {
+  /***
+   * Test: ResourceTemplate Creation with String Pattern
+   */
+  test("should create ResourceTemplate with string pattern", () => {
+    const template = new ResourceTemplate("test://{category}/{id}", {
+      list: undefined,
+    });
+    expect(template.uriTemplate.toString()).toBe("test://{category}/{id}");
+    expect(template.listCallback).toBeUndefined();
+  });
+
+  /***
+   * Test: ResourceTemplate Creation with UriTemplate Instance
+   */
+  test("should create ResourceTemplate with UriTemplate", () => {
+    const uriTemplate = new UriTemplate("test://{category}/{id}");
+    const template = new ResourceTemplate(uriTemplate, { list: undefined });
+    expect(template.uriTemplate).toBe(uriTemplate);
+    expect(template.listCallback).toBeUndefined();
+  });
+
+  /***
+   * Test: ResourceTemplate with List Callback
+   */
+  test("should create ResourceTemplate with list callback", async () => {
+    const list = jest.fn().mockResolvedValue({
+      resources: [{ name: "Test", uri: "test://example" }],
+    });
+
+    const template = new ResourceTemplate("test://{id}", { list });
+    expect(template.listCallback).toBe(list);
+
+    const abortController = new AbortController();
+    const result = await template.listCallback?.({
+      signal: abortController.signal,
+      requestId: 'not-implemented',
+      sendRequest: () => { throw new Error("Not implemented") },
+      sendNotification: () => { throw new Error("Not implemented") }
+    });
+    expect(result?.resources).toHaveLength(1);
+    expect(list).toHaveBeenCalled();
+  });
+});
+
+describe("tool()", () => {
+  /***
+   * Test: Zero-Argument Tool Registration
+   */
+  test("should register zero-argument tool", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const notifications: Notification[] = []
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+    client.fallbackNotificationHandler = async (notification) => {
+      notifications.push(notification)
+    }
+
+    mcpServer.tool("test", async () => ({
+      content: [
+        {
+          type: "text",
+          text: "Test response",
+        },
+      ],
+    }));
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.connect(serverTransport),
+    ]);
+
+    const result = await client.request(
+      {
+        method: "tools/list",
+      },
+      ListToolsResultSchema,
+    );
+
+    expect(result.tools).toHaveLength(1);
+    expect(result.tools[0].name).toBe("test");
+    expect(result.tools[0].inputSchema).toEqual({
+      type: "object",
+    });
+
+    // Adding the tool before the connection was established means no notification was sent
+    expect(notifications).toHaveLength(0)
+
+    // Adding another tool triggers the update notification
+    mcpServer.tool("test2", async () => ({
+      content: [
+        {
+          type: "text",
+          text: "Test response",
+        },
+      ],
+    }));
+
+    // Yield event loop to let the notification fly
+    await new Promise(process.nextTick)
+
+    expect(notifications).toMatchObject([
+      {
+        method: "notifications/tools/list_changed",
+      }
+    ])
+  });
+
+  /***
+   * Test: Updating Existing Tool
+   */
+  test("should update existing tool", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const notifications: Notification[] = []
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+    client.fallbackNotificationHandler = async (notification) => {
+      notifications.push(notification)
+    }
+
+    // Register initial tool
+    const tool = mcpServer.tool("test", async () => ({
+      content: [
+        {
+          type: "text",
+          text: "Initial response",
+        },
+      ],
+    }));
+
+    // Update the tool
+    tool.update({
+      callback: async () => ({
+        content: [
+          {
+            type: "text",
+            text: "Updated response",
+          },
+        ],
+      })
+    });
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.connect(serverTransport),
+    ]);
+
+    // Call the tool and verify we get the updated response
+    const result = await client.request(
+      {
+        method: "tools/call",
+        params: {
+          name: "test",
+        },
+      },
+      CallToolResultSchema,
+    );
+
+    expect(result.content).toEqual([
+      {
+        type: "text",
+        text: "Updated response",
+      },
+    ]);
+
+    // Update happened before transport was connected, so no notifications should be expected
+    expect(notifications).toHaveLength(0)
+  });
+
+  /***
+   * Test: Updating Tool with Schema
+   */
+  test("should update tool with schema", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const notifications: Notification[] = []
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+    client.fallbackNotificationHandler = async (notification) => {
+      notifications.push(notification)
+    }
+
+    // Register initial tool
+    const tool = mcpServer.tool(
+      "test",
+      {
+        name: z.string(),
+      },
+      async ({ name }) => ({
+        content: [
+          {
+            type: "text",
+            text: `Initial: ${name}`,
+          },
+        ],
+      }),
+    );
+
+    // Update the tool with a different schema
+    tool.update({
+      paramsSchema: {
+        name: z.string(),
+        value: z.number(),
+      },
+      callback: async ({ name, value }) => ({
+        content: [
+          {
+            type: "text",
+            text: `Updated: ${name}, ${value}`,
+          },
+        ],
+      })
+    });
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.connect(serverTransport),
+    ]);
+
+    // Verify the schema was updated
+    const listResult = await client.request(
+      {
+        method: "tools/list",
+      },
+      ListToolsResultSchema,
+    );
+
+    expect(listResult.tools[0].inputSchema).toMatchObject({
+      properties: {
+        name: { type: "string" },
+        value: { type: "number" },
+      },
+    });
+
+    // Call the tool with the new schema
+    const callResult = await client.request(
+      {
+        method: "tools/call",
+        params: {
+          name: "test",
+          arguments: {
+            name: "test",
+            value: 42,
+          },
+        },
+      },
+      CallToolResultSchema,
+    );
+
+    expect(callResult.content).toEqual([
+      {
+        type: "text",
+        text: "Updated: test, 42",
+      },
+    ]);
+
+    // Update happened before transport was connected, so no notifications should be expected
+    expect(notifications).toHaveLength(0)
+  });
+
+  /***
+   * Test: Tool List Changed Notifications
+   */
+  test("should send tool list changed notifications when connected", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const notifications: Notification[] = []
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+    client.fallbackNotificationHandler = async (notification) => {
+      notifications.push(notification)
+    }
+
+    // Register initial tool
+    const tool = mcpServer.tool("test", async () => ({
+      content: [
+        {
+          type: "text",
+          text: "Test response",
+        },
+      ],
+    }));
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.connect(serverTransport),
+    ]);
+
+    expect(notifications).toHaveLength(0)
+
+    // Now update the tool
+    tool.update({
+      callback: async () => ({
+        content: [
+          {
+            type: "text",
+            text: "Updated response",
+          },
+        ],
+      })
+    });
+
+    // Yield event loop to let the notification fly
+    await new Promise(process.nextTick)
+
+    expect(notifications).toMatchObject([
+      { method: "notifications/tools/list_changed" }
+    ])
+
+    // Now delete the tool
+    tool.remove();
+
+    // Yield event loop to let the notification fly
+    await new Promise(process.nextTick)
+
+    expect(notifications).toMatchObject([
+      { method: "notifications/tools/list_changed" },
+      { method: "notifications/tools/list_changed" },
+    ])
+  });
+
+  /***
+   * Test: Tool Registration with Parameters
+   */
+  test("should register tool with params", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    // old api
+    mcpServer.tool(
+      "test",
+      {
+        name: z.string(),
+        value: z.number(),
+      },
+      async ({ name, value }) => ({
+        content: [
+          {
+            type: "text",
+            text: `${name}: ${value}`,
+          },
+        ],
+      }),
+    );
+
+    // new api
+    mcpServer.registerTool(
+      "test (new api)",
+      {
+        inputSchema: { name: z.string(), value: z.number() },
+      },
+      async ({ name, value }) => ({
+        content: [{ type: "text", text: `${name}: ${value}` }],
+      })
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    const result = await client.request(
+      {
+        method: "tools/list",
+      },
+      ListToolsResultSchema,
+    );
+
+    expect(result.tools).toHaveLength(2);
+    expect(result.tools[0].name).toBe("test");
+    expect(result.tools[0].inputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        value: { type: "number" },
+      },
+    });
+    expect(result.tools[1].name).toBe("test (new api)");
+    expect(result.tools[1].inputSchema).toEqual(result.tools[0].inputSchema);
+  });
+
+  /***
+   * Test: Tool Registration with Description
+   */
+  test("should register tool with description", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    // old api
+    mcpServer.tool("test", "Test description", async () => ({
+      content: [
+        {
+          type: "text",
+          text: "Test response",
+        },
+      ],
+    }));
+
+    // new api
+    mcpServer.registerTool(
+      "test (new api)",
+      {
+        description: "Test description",
+      },
+      async () => ({
+        content: [
+          {
+            type: "text" as const,
+            text: "Test response",
+          },
+        ],
+      })
+    );
+
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    const result = await client.request(
+      {
+        method: "tools/list",
+      },
+      ListToolsResultSchema,
+    );
+
+    expect(result.tools).toHaveLength(2);
+    expect(result.tools[0].name).toBe("test");
+    expect(result.tools[0].description).toBe("Test description");
+    expect(result.tools[1].name).toBe("test (new api)");
+    expect(result.tools[1].description).toBe("Test description");
+  });
+
+  /***
+   * Test: Tool Registration with Annotations
+   */
+  test("should register tool with annotations", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    mcpServer.tool("test", { title: "Test Tool", readOnlyHint: true }, async () => ({
+      content: [
+        {
+          type: "text",
+          text: "Test response",
+        },
+      ],
+    }));
+
+    mcpServer.registerTool(
+      "test (new api)",
+      {
+        annotations: { title: "Test Tool", readOnlyHint: true },
+      },
+      async () => ({
+        content: [
+          {
+            type: "text" as const,
+            text: "Test response",
+          },
+        ],
+      })
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    const result = await client.request(
+      {
+        method: "tools/list",
+      },
+      ListToolsResultSchema,
+    );
+
+    expect(result.tools).toHaveLength(2);
+    expect(result.tools[0].name).toBe("test");
+    expect(result.tools[0].annotations).toEqual({ title: "Test Tool", readOnlyHint: true });
+    expect(result.tools[1].name).toBe("test (new api)");
+    expect(result.tools[1].annotations).toEqual({ title: "Test Tool", readOnlyHint: true });
+  });
+
+  /***
+   * Test: Tool Registration with Parameters and Annotations
+   */
+  test("should register tool with params and annotations", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    mcpServer.tool(
+      "test",
+      { name: z.string() },
+      { title: "Test Tool", readOnlyHint: true },
+      async ({ name }) => ({
+        content: [{ type: "text", text: `Hello, ${name}!` }]
+      })
+    );
+
+    mcpServer.registerTool(
+      "test (new api)",
+      {
+        inputSchema: { name: z.string() },
+        annotations: { title: "Test Tool", readOnlyHint: true },
+      },
+      async ({ name }) => ({
+        content: [{ type: "text", text: `Hello, ${name}!` }]
+      })
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    const result = await client.request(
+      { method: "tools/list" },
+      ListToolsResultSchema,
+    );
+
+    expect(result.tools).toHaveLength(2);
+    expect(result.tools[0].name).toBe("test");
+    expect(result.tools[0].inputSchema).toMatchObject({
+      type: "object",
+      properties: { name: { type: "string" } }
+    });
+    expect(result.tools[0].annotations).toEqual({ title: "Test Tool", readOnlyHint: true });
+    expect(result.tools[1].name).toBe("test (new api)");
+    expect(result.tools[1].inputSchema).toEqual(result.tools[0].inputSchema);
+    expect(result.tools[1].annotations).toEqual(result.tools[0].annotations);
+  });
+
+  /***
+   * Test: Tool Registration with Description, Parameters, and Annotations
+   */
+  test("should register tool with description, params, and annotations", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    mcpServer.tool(
+      "test",
+      "A tool with everything",
+      { name: z.string() },
+      { title: "Complete Test Tool", readOnlyHint: true, openWorldHint: false },
+      async ({ name }) => ({
+        content: [{ type: "text", text: `Hello, ${name}!` }]
+      })
+    );
+
+    mcpServer.registerTool(
+      "test (new api)",
+      {
+        description: "A tool with everything",
+        inputSchema: { name: z.string() },
+        annotations: { title: "Complete Test Tool", readOnlyHint: true, openWorldHint: false },
+      },
+      async ({ name }) => ({
+        content: [{ type: "text", text: `Hello, ${name}!` }]
+      })
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    const result = await client.request(
+      { method: "tools/list" },
+      ListToolsResultSchema,
+    );
+
+    expect(result.tools).toHaveLength(2);
+    expect(result.tools[0].name).toBe("test");
+    expect(result.tools[0].description).toBe("A tool with everything");
+    expect(result.tools[0].inputSchema).toMatchObject({
+      type: "object",
+      properties: { name: { type: "string" } }
+    });
+    expect(result.tools[0].annotations).toEqual({
+      title: "Complete Test Tool",
+      readOnlyHint: true,
+      openWorldHint: false
+    });
+    expect(result.tools[1].name).toBe("test (new api)");
+    expect(result.tools[1].description).toBe("A tool with everything");
+    expect(result.tools[1].inputSchema).toEqual(result.tools[0].inputSchema);
+    expect(result.tools[1].annotations).toEqual(result.tools[0].annotations);
+  });
+
+  /***
+   * Test: Tool Registration with Description, Empty Parameters, and Annotations
+   */
+  test("should register tool with description, empty params, and annotations", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    mcpServer.tool(
+      "test",
+      "A tool with everything but empty params",
+      {},
+      { title: "Complete Test Tool with empty params", readOnlyHint: true, openWorldHint: false },
+      async () => ({
+        content: [{ type: "text", text: "Test response" }]
+      })
+    );
+
+    mcpServer.registerTool(
+      "test (new api)",
+      {
+        description: "A tool with everything but empty params",
+        inputSchema: {},
+        annotations: { title: "Complete Test Tool with empty params", readOnlyHint: true, openWorldHint: false },
+      },
+      async () => ({
+        content: [{ type: "text" as const, text: "Test response" }]
+      })
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    const result = await client.request(
+      { method: "tools/list" },
+      ListToolsResultSchema,
+    );
+
+    expect(result.tools).toHaveLength(2);
+    expect(result.tools[0].name).toBe("test");
+    expect(result.tools[0].description).toBe("A tool with everything but empty params");
+    expect(result.tools[0].inputSchema).toMatchObject({
+      type: "object",
+      properties: {}
+    });
+    expect(result.tools[0].annotations).toEqual({
+      title: "Complete Test Tool with empty params",
+      readOnlyHint: true,
+      openWorldHint: false
+    });
+    expect(result.tools[1].name).toBe("test (new api)");
+    expect(result.tools[1].description).toBe("A tool with everything but empty params");
+    expect(result.tools[1].inputSchema).toEqual(result.tools[0].inputSchema);
+    expect(result.tools[1].annotations).toEqual(result.tools[0].annotations);
+  });
+
+  /***
+   * Test: Tool Argument Validation
+   */
+  test("should validate tool args", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    mcpServer.tool(
+      "test",
+      {
+        name: z.string(),
+        value: z.number(),
+      },
+      async ({ name, value }) => ({
+        content: [
+          {
+            type: "text",
+            text: `${name}: ${value}`,
+          },
+        ],
+      }),
+    );
+
+    mcpServer.registerTool(
+      "test (new api)",
+      {
+        inputSchema: {
+          name: z.string(),
+          value: z.number(),
+        },
+      },
+      async ({ name, value }) => ({
+        content: [
+          {
+            type: "text",
+            text: `${name}: ${value}`,
+          },
+        ],
+      })
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    await expect(
+      client.request(
+        {
+          method: "tools/call",
+          params: {
+            name: "test",
+            arguments: {
+              name: "test",
+              value: "not a number",
+            },
+          },
+        },
+        CallToolResultSchema,
+      ),
+    ).rejects.toThrow(/Invalid arguments/);
+
+    await expect(
+      client.request(
+        {
+          method: "tools/call",
+          params: {
+            name: "test (new api)",
+            arguments: {
+              name: "test",
+              value: "not a number",
+            },
+          },
+        },
+        CallToolResultSchema,
+      ),
+    ).rejects.toThrow(/Invalid arguments/);
+  });
+
+  /***
+   * Test: Preventing Duplicate Tool Registration
+   */
+  test("should prevent duplicate tool registration", () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+
+    mcpServer.tool("test", async () => ({
+      content: [
+        {
+          type: "text",
+          text: "Test response",
+        },
+      ],
+    }));
+
+    expect(() => {
+      mcpServer.tool("test", async () => ({
+        content: [
+          {
+            type: "text",
+            text: "Test response 2",
+          },
+        ],
+      }));
+    }).toThrow(/already registered/);
+  });
+
+  /***
+   * Test: Multiple Tool Registration
+   */
+  test("should allow registering multiple tools", () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+
+    // This should succeed
+    mcpServer.tool("tool1", () => ({ content: [] }));
+
+    // This should also succeed and not throw about request handlers
+    mcpServer.tool("tool2", () => ({ content: [] }));
+  });
+
+  /***
+   * Test: Tool with Output Schema and Structured Content
+   */
+  test("should support tool with outputSchema and structuredContent", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    // Register a tool with outputSchema
+    mcpServer.registerTool(
+      "test",
+      {
+        description: "Test tool with structured output",
+        inputSchema: {
+          input: z.string(),
+        },
+        outputSchema: {
+          processedInput: z.string(),
+          resultType: z.string(),
+          timestamp: z.string()
+        },
+      },
+      async ({ input }) => ({
+        structuredContent: {
+          processedInput: input,
+          resultType: "structured",
+          timestamp: "2023-01-01T00:00:00Z"
+        },
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              processedInput: input,
+              resultType: "structured",
+              timestamp: "2023-01-01T00:00:00Z"
+            }),
+          },
+        ]
+      })
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    // Verify the tool registration includes outputSchema
+    const listResult = await client.request(
+      {
+        method: "tools/list",
+      },
+      ListToolsResultSchema,
+    );
+
+    expect(listResult.tools).toHaveLength(1);
+    expect(listResult.tools[0].outputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        processedInput: { type: "string" },
+        resultType: { type: "string" },
+        timestamp: { type: "string" }
+      },
+      required: ["processedInput", "resultType", "timestamp"]
+    });
+
+    // Call the tool and verify it returns valid structuredContent
+    const result = await client.request(
+      {
+        method: "tools/call",
+        params: {
+          name: "test",
+          arguments: {
+            input: "hello",
+          },
+        },
+      },
+      CallToolResultSchema,
+    );
+
+    expect(result.structuredContent).toBeDefined();
+    const structuredContent = result.structuredContent as {
+      processedInput: string;
+      resultType: string;
+      timestamp: string;
+    };
+    expect(structuredContent.processedInput).toBe("hello");
+    expect(structuredContent.resultType).toBe("structured");
+    expect(structuredContent.timestamp).toBe("2023-01-01T00:00:00Z");
+
+    // For backward compatibility, content is auto-generated from structuredContent
+    expect(result.content).toBeDefined();
+    expect(result.content!).toHaveLength(1);
+    expect(result.content![0]).toMatchObject({ type: "text" });
+    const textContent = result.content![0] as TextContent;
+    expect(JSON.parse(textContent.text)).toEqual(result.structuredContent);
+  });
+
+  /***
+   * Test: Tool with Output Schema Must Provide Structured Content
+   */
+  test("should throw error when tool with outputSchema returns no structuredContent", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    // Register a tool with outputSchema that returns only content without structuredContent
+    mcpServer.registerTool(
+      "test",
+      {
+        description: "Test tool with output schema but missing structured content",
+        inputSchema: {
+          input: z.string(),
+        },
+        outputSchema: {
+          processedInput: z.string(),
+          resultType: z.string(),
+        },
+      },
+      async ({ input }) => ({
+        // Only return content without structuredContent
+        content: [
+          {
+            type: "text",
+            text: `Processed: ${input}`,
+          },
+        ],
+      })
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    // Call the tool and expect it to throw an error
+    await expect(
+      client.callTool({
+        name: "test",
+        arguments: {
+          input: "hello",
+        },
+      }),
+    ).rejects.toThrow(/Tool test has an output schema but no structured content was provided/);
+  });
+
+  /***
+   * Test: Schema Validation Failure for Invalid Structured Content
+   */
+  test("should fail schema validation when tool returns invalid structuredContent", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    // Register a tool with outputSchema that returns invalid data
+    mcpServer.registerTool(
+      "test",
+      {
+        description: "Test tool with invalid structured output",
+        inputSchema: {
+          input: z.string(),
+        },
+        outputSchema: {
+          processedInput: z.string(),
+          resultType: z.string(),
+          timestamp: z.string()
+        },
+      },
+      async ({ input }) => ({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              processedInput: input,
+              resultType: "structured",
+              // Missing required 'timestamp' field
+              someExtraField: "unexpected" // Extra field not in schema
+            }),
+          },
+        ],
+        structuredContent: {
+          processedInput: input,
+          resultType: "structured",
+          // Missing required 'timestamp' field
+          someExtraField: "unexpected" // Extra field not in schema
+        },
+      })
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    // Call the tool and expect it to throw a server-side validation error
+    await expect(
+      client.callTool({
+        name: "test",
+        arguments: {
+          input: "hello",
+        },
+      }),
+    ).rejects.toThrow(/Invalid structured content for tool test/);
+  });
+
+  /***
+   * Test: Pass Session ID to Tool Callback
+   */
+  test("should pass sessionId to tool callback via RequestHandlerExtra", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    let receivedSessionId: string | undefined;
+    mcpServer.tool("test-tool", async (extra) => {
+      receivedSessionId = extra.sessionId;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Test response",
+          },
+        ],
+      };
+    });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    // Set a test sessionId on the server transport
+    serverTransport.sessionId = "test-session-123";
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    await client.request(
+      {
+        method: "tools/call",
+        params: {
+          name: "test-tool",
+        },
+      },
+      CallToolResultSchema,
+    );
+
+    expect(receivedSessionId).toBe("test-session-123");
+  });
+
+  /***
+   * Test: Pass Request ID to Tool Callback
+   */
+  test("should pass requestId to tool callback via RequestHandlerExtra", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    let receivedRequestId: string | number | undefined;
+    mcpServer.tool("request-id-test", async (extra) => {
+      receivedRequestId = extra.requestId;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Received request ID: ${extra.requestId}`,
+          },
+        ],
+      };
+    });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    const result = await client.request(
+      {
+        method: "tools/call",
+        params: {
+          name: "request-id-test",
+        },
+      },
+      CallToolResultSchema,
+    );
+
+    expect(receivedRequestId).toBeDefined();
+    expect(typeof receivedRequestId === 'string' || typeof receivedRequestId === 'number').toBe(true);
+    expect(result.content && result.content[0].text).toContain("Received request ID:");
+  });
+
+  /***
+   * Test: Send Notification within Tool Call
+   */
+  test("should provide sendNotification within tool call", async () => {
+    const mcpServer = new McpServer(
+      {
+        name: "test server",
+        version: "1.0",
+      },
+      { capabilities: { logging: {} } },
+    );
+
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    let receivedLogMessage: string | undefined;
+    const loggingMessage = "hello here is log message 1";
+
+    client.setNotificationHandler(LoggingMessageNotificationSchema, (notification) => {
+      receivedLogMessage = notification.params.data as string;
+    });
+
+    mcpServer.tool("test-tool", async ({ sendNotification }) => {
+      await sendNotification({ method: "notifications/message", params: { level: "debug", data: loggingMessage } });
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Test response",
+          },
+        ],
+      };
+    });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+    await client.request(
+      {
+        method: "tools/call",
+        params: {
+          name: "test-tool",
+        },
+      },
+      CallToolResultSchema,
+    );
+    expect(receivedLogMessage).toBe(loggingMessage);
+  });
+
+  /***
+   * Test: Client to Server Tool Call
+   */
+  test("should allow client to call server tools", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    mcpServer.tool(
+      "test",
+      "Test tool",
+      {
+        input: z.string(),
+      },
+      async ({ input }) => ({
+        content: [
+          {
+            type: "text",
+            text: `Processed: ${input}`,
+          },
+        ],
+      }),
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    const result = await client.request(
+      {
+        method: "tools/call",
+        params: {
+          name: "test",
+          arguments: {
+            input: "hello",
+          },
+        },
+      },
+      CallToolResultSchema,
+    );
+
+    expect(result.content).toEqual([
+      {
+        type: "text",
+        text: "Processed: hello",
+      },
+    ]);
+  });
+
+  /***
+   * Test: Graceful Tool Error Handling
+   */
+  test("should handle server tool errors gracefully", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    mcpServer.tool("error-test", async () => {
+      throw new Error("Tool execution failed");
+    });
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    const result = await client.request(
+      {
+        method: "tools/call",
+        params: {
+          name: "error-test",
+        },
+      },
+      CallToolResultSchema,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toEqual([
+      {
+        type: "text",
+        text: "Tool execution failed",
+      },
+    ]);
+  });
+
+  /***
+   * Test: McpError for Invalid Tool Name
+   */
+  test("should throw McpError for invalid tool name", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    mcpServer.tool("test-tool", async () => ({
+      content: [
+        {
+          type: "text",
+          text: "Test response",
+        },
+      ],
+    }));
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    await expect(
+      client.request(
+        {
+          method: "tools/call",
+          params: {
+            name: "nonexistent-tool",
+          },
+        },
+        CallToolResultSchema,
+      ),
+    ).rejects.toThrow(/Tool nonexistent-tool not found/);
+  });
+
+  /***
+   * Test: Remote Tool Functionality (bypasses Zod validation)
+   */
+  test("should register and call remote tools without Zod validation", async () => {
+    const mcpServer = new McpServer({
+      name: "test server",
+      version: "1.0",
+    });
+    
+    const client = new Client({
+      name: "test client",
+      version: "1.0",
+    });
+
+    // Register a remote tool that bypasses Zod validation
+    mcpServer.registerTool(
+      "remote-tool",
+      {
+        title: "Remote Tool",
+        description: "A tool that passes through arguments without validation",
+        remote: true,
+        remoteInputSchema: {
+          type: "object",
+          properties: {
+            input: { type: "string" },
+            value: { type: "number" }
+          }
+        },
+        remoteOutputSchema: {
+          type: "object", 
+          properties: {
+            result: { type: "string" }
+          }
+        }
+      },
+      async (args) => {
+        // The arguments should be passed through without Zod parsing
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Remote tool called with: ${JSON.stringify(args)}`,
+            },
+          ],
+        };
+      }
+    );
+
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+
+    await Promise.all([
+      client.connect(clientTransport),
+      mcpServer.server.connect(serverTransport),
+    ]);
+
+    // Test that the tool is listed correctly with remote schema
+    const listResult = await client.request(
+      {
+        method: "tools/list",
+      },
+      ListToolsResultSchema
+    );
+
+    const remoteTool = listResult.tools.find(t => t.name === "remote-tool");
+    expect(remoteTool).toBeDefined();
+    expect(remoteTool?.title).toBe("Remote Tool");
+    expect(remoteTool?.inputSchema).toEqual({
+      type: "object",
+      properties: {
+        input: { type: "string" },
+        value: { type: "number" }
+      }
+    });
+
+    // Test calling the remote tool with arguments that would fail Zod validation
+    // if it were using normal validation (e.g., extra fields)
+    const callResult = await client.request(
+      {
+        method: "tools/call", 
+        params: {
+          name: "remote-tool",
+          arguments: {
+            input: "test input",
+            value: 42,
+            extraField: "this would normally fail Zod validation"
+          }
+        }
+      },
+      CallToolResultSchema
+    );
+
+    expect(callResult.content).toHaveLength(1);
+    expect(callResult.content[0]).toEqual({
+      type: "text",
+      text: `Remote tool called with: {"input":"test input","value":42,"extraField":"this would normally fail Zod validation"}`,
+    });
+
+    await client.close();
+    await mcpServer.server.close();
+  });
 });
 
 describe("resource()", () => {
@@ -4124,107 +5725,3 @@ describe("elicitInput()", () => {
         content: {
           checkAlternatives: true,
           flexibleDates: "same_week"
-        }
-      };
-    });
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-    await Promise.all([
-      client.connect(clientTransport),
-      mcpServer.server.connect(serverTransport),
-    ]);
-
-    // Call the tool
-    const result = await client.callTool({
-      name: "book-restaurant",
-      arguments: {
-        restaurant: "ABC Restaurant",
-        date: "2024-12-25",
-        partySize: 2
-      }
-    });
-
-    expect(checkAvailability).toHaveBeenCalledWith("ABC Restaurant", "2024-12-25", 2);
-    expect(findAlternatives).toHaveBeenCalledWith("ABC Restaurant", "2024-12-25", 2, "same_week");
-    expect(result.content).toEqual([{
-      type: "text",
-      text: "Found these alternatives: 2024-12-26, 2024-12-27, 2024-12-28"
-    }]);
-  });
-
-  test("should handle user declining to elicitation request", async () => {
-    // Mock availability check to return false
-    checkAvailability.mockResolvedValue(false);
-
-    // Set up client to reject alternative date checking
-    client.setRequestHandler(ElicitRequestSchema, async () => {
-      return {
-        action: "accept",
-        content: {
-          checkAlternatives: false
-        }
-      };
-    });
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-    await Promise.all([
-      client.connect(clientTransport),
-      mcpServer.server.connect(serverTransport),
-    ]);
-
-    // Call the tool
-    const result = await client.callTool({
-      name: "book-restaurant",
-      arguments: {
-        restaurant: "ABC Restaurant",
-        date: "2024-12-25",
-        partySize: 2
-      }
-    });
-
-    expect(checkAvailability).toHaveBeenCalledWith("ABC Restaurant", "2024-12-25", 2);
-    expect(findAlternatives).not.toHaveBeenCalled();
-    expect(result.content).toEqual([{
-      type: "text",
-      text: "No booking made. Original date not available."
-    }]);
-  });
-
-  test("should handle user cancelling the elicitation", async () => {
-    // Mock availability check to return false
-    checkAvailability.mockResolvedValue(false);
-
-    // Set up client to cancel the elicitation
-    client.setRequestHandler(ElicitRequestSchema, async () => {
-      return {
-        action: "cancel"
-      };
-    });
-
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-    await Promise.all([
-      client.connect(clientTransport),
-      mcpServer.server.connect(serverTransport),
-    ]);
-
-    // Call the tool
-    const result = await client.callTool({
-      name: "book-restaurant",
-      arguments: {
-        restaurant: "ABC Restaurant",
-        date: "2024-12-25",
-        partySize: 2
-      }
-    });
-
-    expect(checkAvailability).toHaveBeenCalledWith("ABC Restaurant", "2024-12-25", 2);
-    expect(findAlternatives).not.toHaveBeenCalled();
-    expect(result.content).toEqual([{
-      type: "text",
-      text: "No booking made. Original date not available."
-    }]);
-  });
-});
